@@ -1,0 +1,11 @@
+[package]
+name = "aviutl2_alias_inserter"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]   # DLL（.aux2）として出力
+
+[dependencies]
+aviutl2 = "0.23"           # crates.io から取得
+windows = { version = "0.59", features = ["Win32_System_Pipes", "Win32_Storage_FileSystem"] }
