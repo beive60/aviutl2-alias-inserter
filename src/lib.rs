@@ -70,6 +70,10 @@ const MAX_PAYLOAD_BYTES: usize = 32_768;
 /// シャットダウン時にダミークライアントが接続するまでの最大待機時間。
 const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 
+/// ダミー接続に使用する書き込みアクセス権（`GENERIC_WRITE = 0x40000000`）。  
+/// `windows::Win32::Security::GENERIC_WRITE` に相当する生 u32 値。
+const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
+
 // ─────────────────────────────────────────────────────────────
 // グローバル編集ハンドル
 // ─────────────────────────────────────────────────────────────
@@ -104,8 +108,10 @@ pub struct AliasInserterPlugin {
     worker_thread: Option<JoinHandle<()>>,
 }
 
-// HANDLE はスレッド間で安全に共有できるため Send と Sync を手動実装する。
-unsafe impl Send for AliasInserterPlugin {}
+// JoinHandle<()> は Sync を実装しないため、unsafe impl Sync が必要。
+// プラグインシングルトンは SDK 内の RwLock で保護されているため安全。
+// Arc<AtomicBool> と JoinHandle<()> はどちらも Send を実装するため、
+// Send は自動導出される。
 unsafe impl Sync for AliasInserterPlugin {}
 
 // ─────────────────────────────────────────────────────────────
@@ -198,8 +204,8 @@ impl Drop for AliasInserterPlugin {
 
         // ワーカースレッドの終了を待機
         if let Some(thread) = self.worker_thread.take() {
-            if let Err(e) = thread.join() {
-                tracing::error!("ワーカースレッドの終了に失敗しました: {:?}", e);
+            if thread.join().is_err() {
+                tracing::error!("ワーカースレッドがパニックしました。強制終了します");
             }
         }
 
@@ -335,9 +341,8 @@ fn wait_for_client(pipe: HANDLE) -> bool {
     match unsafe { ConnectNamedPipe(pipe, None) } {
         Ok(()) => true,
         Err(e) => {
-            // ERROR_PIPE_CONNECTED: クライアントがすでに接続している場合は成功
-            let win32_code = (e.code().0 as u32) & 0xFFFF;
-            if win32_code == ERROR_PIPE_CONNECTED.0 {
+            // ERROR_PIPE_CONNECTED: クライアントがすでに接続している場合は成功扱い
+            if e.code() == ERROR_PIPE_CONNECTED.to_hresult() {
                 true
             } else {
                 tracing::error!("ConnectNamedPipe が失敗しました: {}", e);
@@ -395,8 +400,7 @@ fn connect_shutdown_client() {
     let handle = unsafe {
         windows::Win32::Storage::FileSystem::CreateFileW(
             PCWSTR(pipe_name_wide.as_ptr()),
-            // GENERIC_WRITE: 書き込みアクセス（ダミー接続用）
-            0x4000_0000u32,
+            GENERIC_WRITE_ACCESS,
             FILE_SHARE_NONE,
             None,
             OPEN_EXISTING,

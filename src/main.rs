@@ -33,7 +33,7 @@ use std::env;
 use std::path::Path;
 use std::process;
 
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, WriteFile,
 };
@@ -55,6 +55,10 @@ const MAX_WAIT_MS: u32 = 5_000;
 /// 接続リトライ回数。  
 /// `WaitNamedPipeW` が失敗した場合のリトライ上限。
 const MAX_RETRIES: u32 = 3;
+
+/// Named Pipe への書き込みアクセス権（`GENERIC_WRITE = 0x40000000`）。  
+/// `windows::Win32::Security::GENERIC_WRITE` に相当する生 u32 値。
+const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
 
 // ─────────────────────────────────────────────────────────────
 // エントリーポイント
@@ -199,8 +203,7 @@ fn connect_with_retry(pipe_name: PCWSTR) -> Result<windows::Win32::Foundation::H
         let result = unsafe {
             windows::Win32::Storage::FileSystem::CreateFileW(
                 pipe_name,
-                // GENERIC_WRITE: 書き込みアクセス (0x40000000)
-                0x4000_0000u32,
+                GENERIC_WRITE_ACCESS,
                 FILE_SHARE_NONE,
                 None,
                 OPEN_EXISTING,
@@ -212,11 +215,10 @@ fn connect_with_retry(pipe_name: PCWSTR) -> Result<windows::Win32::Foundation::H
         match result {
             Ok(handle) => return Ok(handle),
             Err(e) => {
-                let win32_code = (e.code().0 as u32) & 0xFFFF;
                 last_error = format!("{}", e);
 
-                // ERROR_PIPE_BUSY (231): パイプがビジー → 待機してリトライ
-                if win32_code == 231 {
+                // ERROR_PIPE_BUSY: パイプがビジー → 待機してリトライ
+                if e.code() == ERROR_PIPE_BUSY.to_hresult() {
                     eprintln!(
                         "パイプが使用中です。待機してリトライします... ({}/{})",
                         attempt + 1,
