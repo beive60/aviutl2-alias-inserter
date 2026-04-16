@@ -1,0 +1,315 @@
+//! # AviUtl2 エイリアス挿入 CLI クライアント
+//!
+//! AviUtl2 エイリアス挿入プラグインに対して `.object` ファイルのパスを送信する
+//! 軽量なコマンドラインツール。
+//!
+//! ## 使用方法
+//!
+//! ```text
+//! alias_inserter_cli.exe <.objectファイルの絶対パス>
+//! ```
+//!
+//! ## 動作概要
+//!
+//! 1. コマンドライン引数から `.object` ファイルの絶対パスを取得する。
+//! 2. パスを UTF-16LE（BOM なし）にエンコードする。
+//! 3. Named Pipe（`\\.\pipe\aviutl2_alias_inserter`）に接続する。
+//! 4. エンコードされたパスを送信して接続を閉じる。
+//!
+//! ## エラー処理
+//!
+//! 接続失敗やファイル検証エラーが発生した場合は標準エラー出力にメッセージを表示し、
+//! 非ゼロの終了コードで終了する。
+//!
+//! ## Steam Deck 統合
+//!
+//! Steam Input のプロファイルで特定ボタンの押下時に本ツールを呼び出すよう設定する：
+//!
+//! ```text
+//! alias_inserter_cli.exe "C:\エイリアス\テキスト.object"
+//! ```
+
+use std::env;
+use std::path::Path;
+use std::process;
+
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, WriteFile,
+};
+use windows::Win32::System::Pipes::WaitNamedPipeW;
+use windows::core::PCWSTR;
+
+// ─────────────────────────────────────────────────────────────
+// 定数
+// ─────────────────────────────────────────────────────────────
+
+/// 接続先の Named Pipe 名。  
+/// プラグイン側と同一の値でなければならない。
+const PIPE_NAME: &str = r"\\.\pipe\aviutl2_alias_inserter";
+
+/// パイプが利用可能になるまでの最大待機時間（ミリ秒）。  
+/// プラグインがまだ起動していない場合の待機上限。
+const MAX_WAIT_MS: u32 = 5_000;
+
+/// 接続リトライ回数。  
+/// `WaitNamedPipeW` が失敗した場合のリトライ上限。
+const MAX_RETRIES: u32 = 3;
+
+// ─────────────────────────────────────────────────────────────
+// エントリーポイント
+// ─────────────────────────────────────────────────────────────
+
+/// CLI クライアントのエントリーポイント。
+///
+/// コマンドライン引数を解析し、Named Pipe 経由でプラグインにパスを送信する。
+///
+/// # 終了コード
+///
+/// - `0`：正常終了
+/// - `1`：引数エラーまたはファイル検証エラー
+/// - `2`：Named Pipe への接続または送信に失敗
+fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    // ─── 引数のバリデーション ───
+    if args.len() != 2 {
+        eprintln!("使用方法: {} <.objectファイルの絶対パス>", args[0]);
+        eprintln!("例: {} \"C:\\エイリアス\\テキスト.object\"", args[0]);
+        process::exit(1);
+    }
+
+    let path = &args[1];
+
+    // ─── ファイルパスのバリデーション ───
+    if let Err(msg) = validate_path(path) {
+        eprintln!("エラー: {}", msg);
+        process::exit(1);
+    }
+
+    // ─── Named Pipe への送信 ───
+    if let Err(msg) = send_path_to_plugin(path) {
+        eprintln!("エラー: {}", msg);
+        process::exit(2);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// バリデーション
+// ─────────────────────────────────────────────────────────────
+
+/// ファイルパスのバリデーションを行う。
+///
+/// 以下の条件をチェックする：
+/// 1. 拡張子が `.object` であること。
+/// 2. ファイルが実際に存在すること。
+///
+/// # 引数
+///
+/// * `path` - 検証対象のファイルパス
+///
+/// # 戻り値
+///
+/// バリデーション成功時は `Ok(())`。失敗時はエラーメッセージを返す。
+fn validate_path(path: &str) -> Result<(), String> {
+    if !path.to_ascii_lowercase().ends_with(".object") {
+        return Err(format!(
+            "'.object' 拡張子のファイルを指定してください: {}",
+            path
+        ));
+    }
+
+    if !Path::new(path).exists() {
+        return Err(format!("ファイルが見つかりません: {}", path));
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// Named Pipe 送信
+// ─────────────────────────────────────────────────────────────
+
+/// ファイルパスを Named Pipe 経由でプラグインに送信する。
+///
+/// パスを UTF-16LE（BOM なし）にエンコードしてパイプに書き込む。
+/// プラグインが起動していない場合は `MAX_WAIT_MS` ミリ秒まで待機し、
+/// `MAX_RETRIES` 回リトライする。
+///
+/// # 引数
+///
+/// * `path` - 送信する `.object` ファイルのパス
+///
+/// # 戻り値
+///
+/// 送信成功時は `Ok(())`。失敗時はエラーメッセージを返す。
+fn send_path_to_plugin(path: &str) -> Result<(), String> {
+    let pipe_name_wide: Vec<u16> = PIPE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0u16))
+        .collect();
+
+    let pipe_pcwstr = PCWSTR(pipe_name_wide.as_ptr());
+
+    // ─── パイプが利用可能になるまで待機（リトライ付き）───
+    let handle = connect_with_retry(pipe_pcwstr)?;
+
+    // ─── パスを UTF-16LE にエンコード（null 終端付き）───
+    let payload = encode_utf16le(path);
+
+    // ─── パイプにデータを書き込む ───
+    let mut bytes_written: u32 = 0;
+    unsafe { WriteFile(handle, Some(&payload), Some(&mut bytes_written), None) }
+        .map_err(|e| format!("WriteFile が失敗しました: {}", e))?;
+
+    if bytes_written != payload.len() as u32 {
+        return Err(format!(
+            "送信バイト数が一致しません: 期待={}, 実際={}",
+            payload.len(),
+            bytes_written
+        ));
+    }
+
+    // ─── 接続を閉じる ───
+    unsafe { CloseHandle(handle) }.map_err(|e| format!("CloseHandle が失敗しました: {}", e))?;
+
+    Ok(())
+}
+
+/// Named Pipe にリトライ付きで接続する。
+///
+/// 接続に失敗した場合は `WaitNamedPipeW` で待機してリトライする。
+/// `MAX_RETRIES` 回試みてもすべて失敗した場合はエラーを返す。
+///
+/// パイプがビジー（`ERROR_PIPE_BUSY = 231`）の場合のみリトライし、
+/// それ以外のエラーは即座に返す。
+///
+/// # 引数
+///
+/// * `pipe_name` - 接続先パイプのワイド文字列ポインタ
+///
+/// # 戻り値
+///
+/// 接続成功時はパイプのハンドル。失敗時はエラーメッセージ。
+fn connect_with_retry(pipe_name: PCWSTR) -> Result<windows::Win32::Foundation::HANDLE, String> {
+    let mut last_error = String::new();
+
+    for attempt in 0..MAX_RETRIES {
+        // パイプへの接続を試みる
+        let result = unsafe {
+            windows::Win32::Storage::FileSystem::CreateFileW(
+                pipe_name,
+                // GENERIC_WRITE: 書き込みアクセス (0x40000000)
+                0x4000_0000u32,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        };
+
+        match result {
+            Ok(handle) => return Ok(handle),
+            Err(e) => {
+                let win32_code = (e.code().0 as u32) & 0xFFFF;
+                last_error = format!("{}", e);
+
+                // ERROR_PIPE_BUSY (231): パイプがビジー → 待機してリトライ
+                if win32_code == 231 {
+                    eprintln!(
+                        "パイプが使用中です。待機してリトライします... ({}/{})",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    let _ = unsafe { WaitNamedPipeW(pipe_name, MAX_WAIT_MS) };
+                    // 次のループでリトライ
+                } else {
+                    // ビジー以外のエラーはリトライしない
+                    return Err(format!("Named Pipe への接続に失敗しました: {}", e));
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "Named Pipe への接続に {} 回試みましたが失敗しました (最後のエラー: {})",
+        MAX_RETRIES, last_error
+    ))
+}
+
+// ─────────────────────────────────────────────────────────────
+// ユーティリティ関数
+// ─────────────────────────────────────────────────────────────
+
+/// 文字列を UTF-16LE バイト列（null 終端付き）にエンコードする。
+///
+/// IPC プロトコル仕様に従い、BOM なしの UTF-16LE バイト列を生成する。
+/// `\0\0`（null 終端）を末尾に付加する。
+///
+/// # 引数
+///
+/// * `s` - エンコード対象の UTF-8 文字列
+///
+/// # 戻り値
+///
+/// UTF-16LE エンコードされたバイト列（null 終端付き）
+fn encode_utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16()
+        .chain(std::iter::once(0u16)) // null 終端
+        .flat_map(|c| c.to_le_bytes())
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────
+// テスト
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ASCII 文字列の UTF-16LE エンコードを確認する。
+    #[test]
+    fn test_encode_utf16le_ascii() {
+        let encoded = encode_utf16le("AB");
+        // 'A' = 0x0041 (LE: 0x41, 0x00), 'B' = 0x0042 (LE: 0x42, 0x00), null終端
+        assert_eq!(encoded, vec![0x41, 0x00, 0x42, 0x00, 0x00, 0x00]);
+    }
+
+    /// 日本語文字列の UTF-16LE エンコードを確認する（null 終端含む）。
+    #[test]
+    fn test_encode_utf16le_japanese() {
+        let encoded = encode_utf16le("あ");
+        // 'あ' = U+3042 (LE: 0x42, 0x30), null終端
+        assert_eq!(encoded, vec![0x42, 0x30, 0x00, 0x00]);
+    }
+
+    /// 空文字列のエンコードが null 終端のみになることを確認する。
+    #[test]
+    fn test_encode_utf16le_empty() {
+        let encoded = encode_utf16le("");
+        assert_eq!(encoded, vec![0x00, 0x00]);
+    }
+
+    /// '.object' 拡張子の検証が正しく機能することを確認する。
+    #[test]
+    fn test_validate_path_extension() {
+        // 実在するファイルでないためファイル存在チェックより前に拡張子エラー
+        assert!(validate_path("C:\\test.txt").is_err());
+        assert!(validate_path("C:\\test.exe").is_err());
+        // .object であってもファイルが存在しなければエラー
+        let result = validate_path("C:\\nonexistent.object");
+        assert!(result.is_err());
+    }
+
+    /// 大文字小文字を区別しない拡張子チェックを確認する。
+    #[test]
+    fn test_validate_path_extension_case_insensitive() {
+        // .OBJECT でも同様にファイル存在チェックに進む
+        let result = validate_path("C:\\nonexistent.OBJECT");
+        // 拡張子はOKだがファイルが存在しないのでエラー
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("ファイルが見つかりません"));
+    }
+}

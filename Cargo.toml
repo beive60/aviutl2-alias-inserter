@@ -3,9 +3,23 @@ name = "aviutl2_alias_inserter"
 version = "0.1.0"
 edition = "2024"
 
+# プラグイン DLL（.aux2）ターゲット
 [lib]
-crate-type = ["cdylib"]   # DLL（.aux2）として出力
+name = "aviutl2_alias_inserter"
+crate-type = ["cdylib"]
+
+# CLI クライアント実行ファイルターゲット
+[[bin]]
+name = "alias_inserter_cli"
+path = "src/main.rs"
 
 [dependencies]
-aviutl2 = "0.23"           # crates.io から取得
-windows = { version = "0.59", features = ["Win32_System_Pipes", "Win32_Storage_FileSystem"] }
+# AviUtl2 SDK の Rust バインディング（汎用プラグイン API を使用）
+aviutl2 = "0.23"
+# Windows API バインディング（Named Pipe / ファイル I/O / セキュリティ）
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+] }
