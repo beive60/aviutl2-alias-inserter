@@ -33,7 +33,7 @@ use std::env;
 use std::path::Path;
 use std::process;
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, WriteFile,
 };
@@ -61,10 +61,26 @@ const MAX_RETRIES: u32 = 3;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
 
 // ─────────────────────────────────────────────────────────────
-// エントリーポイント
+// RAII ハンドルガード
 // ─────────────────────────────────────────────────────────────
 
-/// CLI クライアントのエントリーポイント。
+/// Named Pipe のハンドルを RAII で管理するガード型。
+///
+/// スコープを抜けると自動的に `CloseHandle` を呼び出す。
+/// `WriteFile` 失敗やバイト数不一致でエラーリターンする場合でも
+/// ハンドルが必ずクローズされることを保証する。
+struct PipeHandleGuard(windows::Win32::Foundation::HANDLE);
+
+impl Drop for PipeHandleGuard {
+    /// スコープを抜けると自動的に `CloseHandle` を呼び出す。
+    fn drop(&mut self) {
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// エントリーポイント
+// ─────────────────────────────────────────────────────────────
 ///
 /// コマンドライン引数を解析し、Named Pipe 経由でプラグインにパスを送信する。
 ///
@@ -158,6 +174,9 @@ fn send_path_to_plugin(path: &str) -> Result<(), String> {
     // ─── パイプが利用可能になるまで待機（リトライ付き）───
     let handle = connect_with_retry(pipe_pcwstr)?;
 
+    // RAII ガード: WriteFile 失敗・バイト数不一致のエラーパスでも確実にクローズする
+    let _guard = PipeHandleGuard(handle);
+
     // ─── パスを UTF-16LE にエンコード（null 終端付き）───
     let payload = encode_utf16le(path);
 
@@ -174,19 +193,22 @@ fn send_path_to_plugin(path: &str) -> Result<(), String> {
         ));
     }
 
-    // ─── 接続を閉じる ───
-    unsafe { CloseHandle(handle) }.map_err(|e| format!("CloseHandle が失敗しました: {}", e))?;
-
+    // _guard のスコープ終了時に CloseHandle が呼ばれる
     Ok(())
 }
 
 /// Named Pipe にリトライ付きで接続する。
 ///
-/// 接続に失敗した場合は `WaitNamedPipeW` で待機してリトライする。
+/// 接続に失敗した場合は状況に応じて待機してリトライする。
 /// `MAX_RETRIES` 回試みてもすべて失敗した場合はエラーを返す。
 ///
-/// パイプがビジー（`ERROR_PIPE_BUSY = 231`）の場合のみリトライし、
-/// それ以外のエラーは即座に返す。
+/// ## リトライ条件
+///
+/// | エラー | 対応 |
+/// |---|---|
+/// | `ERROR_PIPE_BUSY` | `WaitNamedPipeW` でインスタンス空きを待つ |
+/// | `ERROR_FILE_NOT_FOUND` | プラグインがまだ起動していない可能性。短いスリープ後にリトライ |
+/// | その他 | 即座にエラーを返す（リトライしない） |
 ///
 /// # 引数
 ///
@@ -217,18 +239,27 @@ fn connect_with_retry(pipe_name: PCWSTR) -> Result<windows::Win32::Foundation::H
             Err(e) => {
                 last_error = format!("{}", e);
 
-                // ERROR_PIPE_BUSY: パイプがビジー → 待機してリトライ
-                if e.code() == ERROR_PIPE_BUSY.to_hresult() {
-                    eprintln!(
-                        "パイプが使用中です。待機してリトライします... ({}/{})",
-                        attempt + 1,
-                        MAX_RETRIES
-                    );
-                    let _ = unsafe { WaitNamedPipeW(pipe_name, MAX_WAIT_MS) };
-                    // 次のループでリトライ
-                } else {
-                    // ビジー以外のエラーはリトライしない
-                    return Err(format!("Named Pipe への接続に失敗しました: {}", e));
+                if attempt < MAX_RETRIES - 1 {
+                    if e.code() == ERROR_PIPE_BUSY.to_hresult() {
+                        // ERROR_PIPE_BUSY: パイプの全インスタンスが使用中 → 空き待ち
+                        eprintln!(
+                            "パイプが使用中です。待機してリトライします... ({}/{})",
+                            attempt + 1,
+                            MAX_RETRIES
+                        );
+                        let _ = unsafe { WaitNamedPipeW(pipe_name, MAX_WAIT_MS) };
+                    } else if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() {
+                        // ERROR_FILE_NOT_FOUND: プラグインがまだ起動していない可能性
+                        eprintln!(
+                            "パイプが見つかりません。プラグインの起動を待機します... ({}/{})",
+                            attempt + 1,
+                            MAX_RETRIES
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    } else {
+                        // その他のエラーはリトライしない
+                        return Err(format!("Named Pipe への接続に失敗しました: {}", e));
+                    }
                 }
             }
         }
@@ -297,11 +328,15 @@ mod tests {
     /// '.object' 拡張子の検証が正しく機能することを確認する。
     #[test]
     fn test_validate_path_extension() {
-        // 実在するファイルでないためファイル存在チェックより前に拡張子エラー
-        assert!(validate_path("C:\\test.txt").is_err());
-        assert!(validate_path("C:\\test.exe").is_err());
+        // 拡張子が違う場合はファイルの存在に関わらずエラー
+        assert!(validate_path("/tmp/test.txt").is_err());
+        assert!(validate_path("/tmp/test.exe").is_err());
         // .object であってもファイルが存在しなければエラー
-        let result = validate_path("C:\\nonexistent.object");
+        let mut nonexistent = std::env::temp_dir();
+        nonexistent.push("_alias_inserter_test_nonexistent.object");
+        // 確実に存在しないパスを使用（万が一存在する場合は削除）
+        let _ = std::fs::remove_file(&nonexistent);
+        let result = validate_path(nonexistent.to_str().unwrap());
         assert!(result.is_err());
     }
 
@@ -309,9 +344,25 @@ mod tests {
     #[test]
     fn test_validate_path_extension_case_insensitive() {
         // .OBJECT でも同様にファイル存在チェックに進む
-        let result = validate_path("C:\\nonexistent.OBJECT");
+        let mut nonexistent = std::env::temp_dir();
+        nonexistent.push("_alias_inserter_test_nonexistent_upper.OBJECT");
+        let _ = std::fs::remove_file(&nonexistent);
+        let result = validate_path(nonexistent.to_str().unwrap());
         // 拡張子はOKだがファイルが存在しないのでエラー
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("ファイルが見つかりません"));
+    }
+
+    /// 実際に存在する `.object` ファイルがバリデーションを通過することを確認する。
+    #[test]
+    fn test_validate_path_existing_object_file() {
+        // プラットフォームに依存しない一時ファイルを作成してテスト
+        let mut path = std::env::temp_dir();
+        path.push("_alias_inserter_test_valid.object");
+        std::fs::write(&path, "").expect("一時ファイルの作成に失敗しました");
+        let path_str = path.to_str().unwrap().to_string();
+        let result = validate_path(&path_str);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_ok(), "実在する .object ファイルはバリデーションを通過するはず");
     }
 }

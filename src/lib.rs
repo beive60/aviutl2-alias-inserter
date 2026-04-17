@@ -37,20 +37,22 @@
 
 use std::path::Path;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::JoinHandle;
 
 use aviutl2::AnyResult;
 use aviutl2::generic::{GenericPlugin, GenericPluginTable, GlobalEditHandle, HostAppHandle};
-use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
 };
 use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
 use windows::Win32::System::Pipes::{
-    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
 };
 use windows::core::PCWSTR;
@@ -76,6 +78,20 @@ const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
 
 // ─────────────────────────────────────────────────────────────
+// スレッド間共有ハンドルラッパー
+// ─────────────────────────────────────────────────────────────
+
+/// `HANDLE` をスレッド間で安全に共有するためのラッパー型。
+///
+/// `HANDLE` は Windows カーネルオブジェクトへの不透明なポインタであり、
+/// Rust では `Send`/`Sync` を実装しない。本型では `Mutex` による排他制御を前提に
+/// `unsafe impl Send` を宣言し、安全にスレッド間受け渡しを可能にする。
+struct SendableHandle(HANDLE);
+
+// Mutex で保護するため、スレッド間送受信は安全。
+unsafe impl Send for SendableHandle {}
+
+// ─────────────────────────────────────────────────────────────
 // グローバル編集ハンドル
 // ─────────────────────────────────────────────────────────────
 
@@ -94,10 +110,13 @@ static EDIT_HANDLE: GlobalEditHandle = GlobalEditHandle::new();
 /// `register()` が呼ばれた時点でワーカースレッドを起動し、
 /// プラグインがアンロードされる（`Drop` が呼ばれる）時点でスレッドを安全に終了する。
 ///
-/// ## フィールド
+/// ## シャットダウンフロー
 ///
-/// - `shutdown_flag`：ワーカースレッドへのシャットダウン通知フラグ。
-/// - `worker_thread`：Named Pipe サーバーを実行するバックグラウンドスレッド。
+/// 1. `shutdown_flag` を `true` に設定する。
+/// 2. `active_pipe` が `Some` ならワーカーは `ReadFile` でブロック中であるため、
+///    `DisconnectNamedPipe` でパイプを強制切断して `ReadFile` を中断させる。
+/// 3. ダミークライアントを接続して `ConnectNamedPipe` のブロックを解除する。
+/// 4. ワーカースレッドの終了を `join()` で待機する。
 #[aviutl2::plugin(GenericPlugin)]
 pub struct AliasInserterPlugin {
     /// シャットダウン要求を伝えるアトミックフラグ。  
@@ -105,15 +124,18 @@ pub struct AliasInserterPlugin {
     shutdown_flag: Arc<AtomicBool>,
 
     /// Named Pipe サーバーを実行するワーカースレッドのハンドル。  
+    /// `Mutex` でラップして `Sync` を安全に満たす。  
     /// `Drop` 時に `join()` して安全に終了を待機する。
-    worker_thread: Option<JoinHandle<()>>,
+    worker_thread: Mutex<Option<JoinHandle<()>>>,
+
+    /// ワーカースレッドが現在接続中のパイプハンドル。  
+    /// `ReadFile` でブロック中の場合は `Some` が設定されており、  
+    /// `Drop` から `DisconnectNamedPipe` を呼び出して I/O を中断できる。
+    active_pipe: Arc<Mutex<Option<SendableHandle>>>,
 }
 
-// JoinHandle<()> は Sync を実装しないため、unsafe impl Sync が必要。
-// プラグインシングルトンは SDK 内の RwLock で保護されているため安全。
-// Arc<AtomicBool> と JoinHandle<()> はどちらも Send を実装するため、
-// Send は自動導出される。
-unsafe impl Sync for AliasInserterPlugin {}
+// Mutex<Option<JoinHandle<()>>> と Arc<Mutex<Option<SendableHandle>>> は
+// どちらも Send + Sync を満たすため、unsafe impl は不要になった。
 
 // ─────────────────────────────────────────────────────────────
 // GenericPlugin トレイト実装
@@ -136,7 +158,8 @@ impl GenericPlugin for AliasInserterPlugin {
         tracing::info!("AviUtl2 エイリアス挿入プラグインを初期化中...");
         Ok(Self {
             shutdown_flag: Arc::new(AtomicBool::new(false)),
-            worker_thread: None,
+            worker_thread: Mutex::new(None),
+            active_pipe: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -170,16 +193,17 @@ impl GenericPlugin for AliasInserterPlugin {
 
         // ワーカースレッドを起動
         let flag = Arc::clone(&self.shutdown_flag);
+        let active_pipe = Arc::clone(&self.active_pipe);
         let thread = std::thread::Builder::new()
             .name("alias_inserter_pipe_server".to_string())
             .spawn(move || {
                 tracing::info!("Named Pipe サーバースレッドを開始しました");
-                pipe_server_loop(flag);
+                pipe_server_loop(flag, active_pipe);
                 tracing::info!("Named Pipe サーバースレッドを終了しました");
             })
             .expect("ワーカースレッドの起動に失敗しました");
 
-        self.worker_thread = Some(thread);
+        *self.worker_thread.lock().unwrap() = Some(thread);
         tracing::info!("Named Pipe サーバーを起動しました: {}", PIPE_NAME);
     }
 }
@@ -191,20 +215,30 @@ impl GenericPlugin for AliasInserterPlugin {
 impl Drop for AliasInserterPlugin {
     /// プラグインのアンロード時にワーカースレッドを安全に終了する。
     ///
+    /// ワーカースレッドには 2 つのブロッキングポイントがあるため、
+    /// それぞれを個別に解除する：
+    ///
     /// 1. シャットダウンフラグを `true` に設定する。
-    /// 2. ダミークライアントをパイプに接続して `ConnectNamedPipe` のブロックを解除する。
-    /// 3. ワーカースレッドの終了を `join()` で待機する。
+    /// 2. `active_pipe` が `Some` の場合（ワーカーが `ReadFile` でブロック中）、
+    ///    `DisconnectNamedPipe` でパイプを強制切断して `ReadFile` を中断させる。
+    /// 3. ダミークライアントをパイプに接続して `ConnectNamedPipe` のブロックを解除する。
+    /// 4. ワーカースレッドの終了を `join()` で待機する。
     fn drop(&mut self) {
         tracing::info!("プラグインをシャットダウン中...");
 
         // シャットダウンフラグを設定
         self.shutdown_flag.store(true, Ordering::Relaxed);
 
+        // ReadFile でブロック中のワーカーを解除（active_pipe が Some ならブロック中）
+        if let Some(h) = self.active_pipe.lock().unwrap().take() {
+            let _ = unsafe { DisconnectNamedPipe(h.0) };
+        }
+
         // ブロック中の ConnectNamedPipe を解除するためにダミー接続を行う
         connect_shutdown_client();
 
         // ワーカースレッドの終了を待機
-        if let Some(thread) = self.worker_thread.take() {
+        if let Some(thread) = self.worker_thread.lock().unwrap().take() {
             if thread.join().is_err() {
                 tracing::error!("ワーカースレッドがパニックしました。強制終了します");
             }
@@ -223,7 +257,8 @@ impl Drop for AliasInserterPlugin {
 /// デバッグビルドでは `DEBUG` レベル、リリースビルドでは `INFO` レベルで出力する。
 /// ログは AviUtl2 の「ログ」ウィンドウに表示される。
 fn init_logging() {
-    aviutl2::tracing_subscriber::fmt()
+    // try_init() を使用して、テスト時やプラグイン再ロード時の二重初期化パニックを回避する。
+    let _ = aviutl2::tracing_subscriber::fmt()
         .with_max_level(if cfg!(debug_assertions) {
             aviutl2::tracing::Level::DEBUG
         } else {
@@ -231,7 +266,7 @@ fn init_logging() {
         })
         .event_format(aviutl2::logger::AviUtl2Formatter)
         .with_writer(aviutl2::logger::AviUtl2LogWriter)
-        .init();
+        .try_init();
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -243,10 +278,16 @@ fn init_logging() {
 /// シャットダウンフラグが `true` になるまで、クライアントの接続→受信→処理を繰り返す。
 /// ループの各イテレーションで新しいパイプインスタンスを作成し、接続を待機する。
 ///
+/// `ReadFile` 中に `Drop` が呼ばれた場合でも安全に終了できるように、
+/// 接続後のパイプハンドルを `active_pipe` に格納する。
+/// `Drop` は `active_pipe` を介して `DisconnectNamedPipe` を呼び出して
+/// `ReadFile` を中断させる。
+///
 /// # 引数
 ///
 /// * `shutdown` - シャットダウン要求を示すアトミックフラグ
-fn pipe_server_loop(shutdown: Arc<AtomicBool>) {
+/// * `active_pipe` - 現在接続中のパイプハンドルを共有するコンテナ
+fn pipe_server_loop(shutdown: Arc<AtomicBool>, active_pipe: Arc<Mutex<Option<SendableHandle>>>) {
     loop {
         // ─── パイプインスタンスを作成 ───
         let pipe = create_server_pipe();
@@ -271,12 +312,25 @@ fn pipe_server_loop(shutdown: Arc<AtomicBool>) {
             break;
         }
 
-        // ─── データを受信 ───
+        // ─── アクティブパイプハンドルを登録 ───
+        // Drop 側が DisconnectNamedPipe で ReadFile を中断できるようにする
+        *active_pipe.lock().unwrap() = Some(SendableHandle(pipe));
+
+        // ─── データを受信（ブロッキング; Drop から中断可能）───
         let received = read_pipe_data(pipe);
+
+        // ─── アクティブパイプハンドルをクリア ───
+        active_pipe.lock().unwrap().take();
 
         // ─── パイプを切断してクローズ ───
         let _ = unsafe { DisconnectNamedPipe(pipe) };
         let _ = unsafe { CloseHandle(pipe) };
+
+        // ─── ReadFile 後のシャットダウンフラグを確認 ───
+        if shutdown.load(Ordering::Relaxed) {
+            tracing::info!("シャットダウンフラグを検出しました（ReadFile 後）。ループを終了します");
+            break;
+        }
 
         // ─── 受信データを処理 ───
         if let Some(data) = received {
@@ -295,7 +349,9 @@ fn pipe_server_loop(shutdown: Arc<AtomicBool>) {
 
 /// Named Pipe のサーバーインスタンスを作成する。
 ///
-/// 読み取り専用（`PIPE_ACCESS_INBOUND`）のバイトモードパイプを作成する。
+/// メッセージモード（`PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE`）で作成することで、
+/// クライアントの `WriteFile` 1 回分が 1 メッセージとして届くことが保証される。
+/// バイトモードと異なり、`ReadFile` で部分的なデータを受け取ることがない。
 ///
 /// # 戻り値
 ///
@@ -310,7 +366,7 @@ fn create_server_pipe() -> HANDLE {
         CreateNamedPipeW(
             PCWSTR(pipe_name_wide.as_ptr()),
             PIPE_ACCESS_INBOUND,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
             MAX_PAYLOAD_BYTES as u32,
             MAX_PAYLOAD_BYTES as u32,
@@ -353,9 +409,14 @@ fn wait_for_client(pipe: HANDLE) -> bool {
     }
 }
 
-/// パイプからデータを読み取る。
+/// パイプから 1 メッセージ分のデータをすべて読み取る。
 ///
-/// 最大 `MAX_PAYLOAD_BYTES` バイトを一度に読み取る。
+/// メッセージモードパイプでは、バッファが足りない場合に `ReadFile` が
+/// `ERROR_MORE_DATA` を返す。そのためループで読み取りを繰り返し、
+/// メッセージ全体を受信するまで続ける。
+///
+/// シャットダウン時（`DisconnectNamedPipe` 呼び出し後）は `ReadFile` が
+/// エラーを返して中断され、`None` を返す。
 ///
 /// # 引数
 ///
@@ -363,24 +424,36 @@ fn wait_for_client(pipe: HANDLE) -> bool {
 ///
 /// # 戻り値
 ///
-/// 受信データのバイト列。読み取り失敗または 0 バイトの場合は `None`。
+/// 受信データのバイト列（メッセージ全体）。読み取り中断時は `None`。
 fn read_pipe_data(pipe: HANDLE) -> Option<Vec<u8>> {
-    let mut buffer = vec![0u8; MAX_PAYLOAD_BYTES];
-    let mut bytes_read: u32 = 0;
+    let mut message: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; MAX_PAYLOAD_BYTES];
 
-    match unsafe { ReadFile(pipe, Some(&mut buffer), Some(&mut bytes_read), None) } {
-        Ok(()) if bytes_read > 0 => {
-            buffer.truncate(bytes_read as usize);
-            Some(buffer)
+    loop {
+        let mut bytes_read: u32 = 0;
+
+        match unsafe { ReadFile(pipe, Some(&mut chunk), Some(&mut bytes_read), None) } {
+            Ok(()) => {
+                // メッセージ全体の読み取り完了
+                message.extend_from_slice(&chunk[..bytes_read as usize]);
+                break;
+            }
+            Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
+                // メッセージが大きくバッファに収まらなかった: 続きを読む
+                message.extend_from_slice(&chunk[..bytes_read as usize]);
+            }
+            Err(_) => {
+                // 接続断（Drop からの DisconnectNamedPipe 等）またはその他のエラー。
+                // シャットダウン時は正常なパスのためログは出さない。
+                return None;
+            }
         }
-        Ok(()) => {
-            tracing::warn!("パイプから 0 バイトを受信しました");
-            None
-        }
-        Err(e) => {
-            tracing::error!("ReadFile が失敗しました: {}", e);
-            None
-        }
+    }
+
+    if message.is_empty() {
+        None
+    } else {
+        Some(message)
     }
 }
 
