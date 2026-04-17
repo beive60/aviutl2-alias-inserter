@@ -92,7 +92,6 @@ version = "0.1.0"
 dependencies = [
  "aviutl2",
  "tracing",
- "tracing-subscriber",
  "windows 0.59.0",
 ]
 
