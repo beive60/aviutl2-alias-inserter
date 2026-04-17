@@ -48,8 +48,9 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, HANDLE, INVA
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
 };
+use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
 use windows::Win32::System::Pipes::{
-    PIPE_ACCESS_INBOUND, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
 };
 use windows::core::PCWSTR;
@@ -147,7 +148,7 @@ impl GenericPlugin for AliasInserterPlugin {
             name: "AviUtl2 Alias Inserter".to_string(),
             information: format!(
                 "AviUtl2 エイリアス自動挿入プラグイン v{} \
-                 / Named Pipe 経由でエイリアスをタイムラインに挿入します",
+                / Named Pipe 経由でエイリアスをタイムラインに挿入します",
                 env!("CARGO_PKG_VERSION")
             ),
         }
@@ -538,15 +539,15 @@ fn insert_alias(path: String) {
 // プラグイン登録マクロ
 // ─────────────────────────────────────────────────────────────
 
-/// AviUtl2 汎用プラグインとして `AliasInserterPlugin` を登録する。
-///
-/// このマクロにより、以下の C エクスポート関数が自動生成される：
-/// - `RequiredVersion()` — 対応最小バージョンを返す
-/// - `InitializeLogger()` — ログハンドルを初期化する
-/// - `InitializePlugin()` — プラグインを初期化する（`new()` を呼び出す）
-/// - `GetCommonPluginTable()` — プラグイン情報テーブルを返す
-/// - `UninitializePlugin()` — プラグインをアンロードする（`drop()` を呼び出す）
-/// - `RegisterPlugin()` — プラグインをホストに登録する（`register()` を呼び出す）
+// AviUtl2 汎用プラグインとして `AliasInserterPlugin` を登録する。
+//
+// このマクロにより、以下の C エクスポート関数が自動生成される：
+// - `RequiredVersion()` — 対応最小バージョンを返す
+// - `InitializeLogger()` — ログハンドルを初期化する
+// - `InitializePlugin()` — プラグインを初期化する（`new()` を呼び出す）
+// - `GetCommonPluginTable()` — プラグイン情報テーブルを返す
+// - `UninitializePlugin()` — プラグインをアンロードする（`drop()` を呼び出す）
+// - `RegisterPlugin()` — プラグインをホストに登録する（`register()` を呼び出す）
 aviutl2::register_generic_plugin!(AliasInserterPlugin);
 
 // ─────────────────────────────────────────────────────────────
