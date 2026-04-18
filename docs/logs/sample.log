@@ -1,0 +1,3 @@
+[04/18 15:50:36] [INFO] [Plugin::aviutl2_alias_inserter.aux2] [aviutl2_alias_inserter] エイリアスパスを受信しました: C:\ProgramData\aviutl2\Alias\test_2files.object
+[04/18 15:50:36] [INFO] [Plugin::aviutl2_alias_inserter.aux2] [aviutl2_alias_inserter] エイリアスを挿入中... ファイル=C:\ProgramData\aviutl2\Alias\test_2files.object, フレーム=329, レイヤー=3
+[04/18 15:50:36] [INFO] [Plugin::aviutl2_alias_inserter.aux2] [aviutl2_alias_inserter] エイリアスの挿入に成功しました: C:\ProgramData\aviutl2\Alias\test_2files.object
