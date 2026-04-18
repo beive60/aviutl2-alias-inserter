@@ -19,19 +19,36 @@ cargo install aviutl2-cli
 
 `au2 prepare` はシンボリックリンクの作成に管理者権限が必要です。
 
-- **Windows 11 24H2 (Build 26052) 以降**: OS ネイティブの `sudo` が利用できます。（管理者権限のターミナルから `sudo config --enable normal` を実行するか、Windowsの設定（システム > 開発者向け）から有効化する必要があります）
-  ```powershell
-  sudo au2 prepare
-  ```
-- **それより前のバージョン**: PowerShell を「管理者として実行」してから実行してください。
-  ```powershell
-  au2 prepare
-  ```
+**Windows 11 24H2 (Build 26052) 以降**: OS ネイティブの `sudo` が利用できます。（管理者権限のターミナルから `sudo config --enable normal` を実行するか、Windowsの設定（システム > 開発者向け）から有効化する必要があります）
 
-開発用ビルドと AviUtl2 への配置は次のコマンドで行います。
+```powershell
+sudo au2 prepare
+```
+
+**それより前のバージョン**: PowerShell を「管理者として実行」してから実行してください。
+
+```powershell
+au2 prepare
+```
+
+### 開発ワークフロー
+
+コードを変更しながら確認する日常の開発ループは `au2 develop`（または短縮形 `au2 dev`）を使います。デバッグビルドを生成し、開発用 AviUtl2 ディレクトリに自動で配置します。
 
 ```powershell
 au2 develop
+```
+
+動作確認には `tests/fixtures/` に収録されているサンプルの `.object` ファイルを使用してください。
+
+```powershell
+.aviutl2-cli\development\data\alias_inserter_cli.exe "$PWD\tests\fixtures\simple.object"
+```
+
+PR 提出前にリリースビルドで動作を確認したい場合は `au2 preview` を使います。リリース設定（最適化あり）でビルドし、開発用 AviUtl2 ディレクトリに配置します。配布用の zip は生成しません。
+
+```powershell
+au2 preview
 ```
 
 ## コントリビューションの流れ
