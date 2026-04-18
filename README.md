@@ -102,7 +102,7 @@ alias_inserter_cli.exe "C:\エイリアス\テキスト.object"
 ## アーキテクチャ
 
 ```text
-[Steam Deck ボタン]
+[Steam Deck ボタンなど]
        |
        v
 [alias_inserter_cli.exe] --UTF-16LE(path)--> [Named Pipe]
