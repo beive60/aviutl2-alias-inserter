@@ -37,7 +37,7 @@ function Assert-CommandExists {
 
 try {
     Write-Host "=== 0/5: Check Prerequisites ==="
-    "cargo", "signtool", "gh" | ForEach-Object { Assert-CommandExists $_ }
+    "cargo", "signtool", "git", "gh" | ForEach-Object { Assert-CommandExists $_ }
     Write-Host "All prerequisites found."
 
     Write-Host "=== 1/5: Build ==="
@@ -49,14 +49,15 @@ try {
 
     $releaseDir = ".\target\release"
     $exePath = "$releaseDir\alias_inserter_cli.exe"
-    $aux2Path = "$releaseDir\aviutl2_alias_inserter.aux2"
+    $dllPath = "$releaseDir\aviutl2_alias_inserter.dll"
 
-    # aux2 は cdylib DLL のリネームであり PE バイナリのため signtool で署名可能
-    signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $exePath
-    signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $aux2Path
+    # dll は cdylib のビルド成果物であり PE バイナリのため signtool で署名可能
+    # リリース ZIP に同梱する際に .aux2 にリネームする
+    signtool sign /tr https://timestamp.digicert.com /td sha256 /fd sha256 /a $exePath
+    signtool sign /tr https://timestamp.digicert.com /td sha256 /fd sha256 /a $dllPath
 
     signtool verify /pa $exePath
-    signtool verify /pa $aux2Path
+    signtool verify /pa $dllPath
 
     Write-Host "=== 3/5: Zip Artifacts ==="
 
@@ -70,7 +71,7 @@ try {
 
     # Copy files to the staging directory
     Copy-Item -Path $exePath -Destination $stagingDir
-    Copy-Item -Path $aux2Path -Destination $stagingDir
+    Copy-Item -Path $dllPath -Destination "$stagingDir\aviutl2_alias_inserter.aux2"
     Copy-Item -Path ".\README.md" -Destination $stagingDir
     Copy-Item -Path ".\LICENSE" -Destination $stagingDir
 
