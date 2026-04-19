@@ -76,7 +76,7 @@ au2 release
 
 | ファイル | 説明 |
 | --- | --- |
-| `Plugin/aviutl2_alias_inserter.aux2` | AviUtl2 プラグイン本体 |
+| `aviutl2_alias_inserter.aux2` | AviUtl2 プラグイン本体 |
 | `alias_inserter_cli.exe` | CLI クライアント |
 
 ## 使い方
