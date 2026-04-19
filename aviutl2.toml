@@ -1,0 +1,36 @@
+#:schema ./.aviutl2-cli/aviutl2.schema.json
+# 設定ファイルについては https://github.com/sevenc-nanashi/aviutl2-cli を参照してください。
+[project]
+id = "aviutl2-alias-inserter"
+name = "aviutl2-alias-inserter"
+version = "0.1.0"
+
+[development]
+aviutl2_version = "latest"
+
+[build_group]
+# 1回のビルドで全バイナリを生成するためのグループ化
+cargo_build_debug = ["cargo build"]
+cargo_build_release = ["cargo build --release"]
+
+[artifacts.plugin]
+destination = "Plugin/aviutl2_alias_inserter.aux2"
+
+[artifacts.plugin.profiles.debug]
+build = { group = "cargo_build_debug" }
+source = "target/debug/aviutl2_alias_inserter.dll"
+
+[artifacts.plugin.profiles.release]
+build = { group = "cargo_build_release" }
+source = "target/release/aviutl2_alias_inserter.dll"
+
+[artifacts.cli]
+destination = "alias_inserter_cli.exe"
+
+[artifacts.cli.profiles.debug]
+build = { group = "cargo_build_debug" }
+source = "target/debug/alias_inserter_cli.exe"
+
+[artifacts.cli.profiles.release]
+build = { group = "cargo_build_release" }
+source = "target/release/alias_inserter_cli.exe"
