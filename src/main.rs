@@ -30,7 +30,7 @@
 //! ```
 
 use std::env;
-use std::path::Path;
+use std::fs::File;
 use std::process;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
@@ -122,7 +122,10 @@ fn main() {
 ///
 /// 以下の条件をチェックする：
 /// 1. 拡張子が `.object` であること。
-/// 2. ファイルが実際に存在すること。
+/// 2. ファイルが実際に開けること（`File::open` で確認）。
+///
+/// `Path::exists()` による事前確認を廃止し `File::open` のエラーで判断することで
+/// TOCTOU 競合状態を排除している。
 ///
 /// # 引数
 ///
@@ -139,9 +142,13 @@ fn validate_path(path: &str) -> Result<(), String> {
         ));
     }
 
-    if !Path::new(path).exists() {
-        return Err(format!("ファイルが見つかりません: {}", path));
-    }
+    File::open(path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("ファイルが見つかりません: {}", path),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("ファイルへのアクセスが拒否されました: {}", path)
+        }
+        _ => format!("ファイルを開けませんでした: {} ({})", path, e),
+    })?;
 
     Ok(())
 }
