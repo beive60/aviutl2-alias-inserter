@@ -142,6 +142,9 @@ fn validate_path(path: &str) -> Result<(), String> {
         ));
     }
 
+    // TOCTOU 対策: exists() による事前確認を廃止し File::open を直接試みる。
+    // ここではファイルの存在と読み取り可能性のみを確認する目的で開く。
+    // ファイルの内容は CLI 側では使用せず、プラグイン側で改めて開いて読み込む。
     File::open(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => format!("ファイルが見つかりません: {}", path),
         std::io::ErrorKind::PermissionDenied => {

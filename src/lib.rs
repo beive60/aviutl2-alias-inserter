@@ -35,6 +35,7 @@
 //! - ペイロード：`.object` ファイルの絶対パス文字列
 //! - 最大ペイロード長：32,768 バイト
 
+use std::io::Read;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -86,8 +87,10 @@ const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
 
 /// 受信したエイリアスファイルの最大許容サイズ（バイト）。  
-/// この制限を超えるファイルは DoS 対策として読み込みを拒否する。
-const MAX_OBJECT_FILE_SIZE: u64 = 1_048_576; // 1 MB
+/// 意図的に巨大なファイルを指定することで AviUtl2 プロセスを OOM クラッシュさせる
+/// DoS 攻撃を防ぐ上限。典型的な `.object` ファイルは数 KiB 以下であるため、
+/// 1 MiB（1,048,576 バイト）は正規の使用を十分にカバーする。
+const MAX_OBJECT_FILE_SIZE: u64 = 1_048_576; // 1 MiB
 
 // ─────────────────────────────────────────────────────────────
 // スレッド間共有ハンドルラッパー
@@ -383,7 +386,10 @@ fn create_server_pipe() -> HANDLE {
     // 現在のユーザーのみアクセス可能なセキュリティ記述子を構築する
     let sd_guard = build_owner_security_descriptor();
     if sd_guard.is_none() {
-        tracing::warn!("セキュリティ記述子の構築に失敗しました。デフォルトのセキュリティ属性で続行します");
+        tracing::warn!(
+            "セキュリティ記述子の構築に失敗しました。\
+             OS デフォルトのセキュリティ属性でパイプを作成します（同一システム上の別ユーザーからアクセス可能になる場合があります）"
+        );
     }
     let sa_storage = sd_guard.as_ref().map(|g| SECURITY_ATTRIBUTES {
         nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -433,10 +439,25 @@ impl Drop for LocalFreeGuard {
     }
 }
 
-// LocalFreeGuard は単一スレッドから作成・破棄するため Send は不要だが、
-// drop が任意のスレッドで呼ばれる可能性があるため実装する。
-// PSECURITY_DESCRIPTOR の内部ポインタは LocalFree のみで触れるため安全。
+// 安全性の根拠：`LocalFreeGuard` は生成後、セキュリティ記述子の内部ポインタを
+// 読み取り専用で `SECURITY_ATTRIBUTES` に設定する目的にのみ使用する。
+// `CreateNamedPipeW` 呼び出し後は参照を保持しないため、内容への再アクセスは発生しない。
+// `drop` は任意のスレッドから呼ばれる可能性があるが、`LocalFree` 自体はスレッドセーフであり、
+// ポインタを他のスレッドと共有して読み書きするわけではないため、データ競合は生じない。
 unsafe impl Send for LocalFreeGuard {}
+
+/// `build_owner_security_descriptor` 内でプロセストークンハンドルを RAII 管理する型。
+///
+/// スコープを抜けると自動的に `CloseHandle` を呼び出す。
+struct TokenHandleGuard(HANDLE);
+
+impl Drop for TokenHandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 /// 現在のプロセスオーナーのみがアクセス可能な Named Pipe 用セキュリティ記述子を構築する。
 ///
@@ -459,26 +480,26 @@ fn build_owner_security_descriptor() -> Option<LocalFreeGuard> {
         // ─── トークンを開く ───
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        // RAII ガードでトークンを自動クローズ（以降のすべての早期リターンでも確実に閉じる）
+        let _token_guard = TokenHandleGuard(token);
 
         // ─── TOKEN_USER 情報のバッファサイズを取得 ───
         let mut required_size = 0u32;
         let _ = GetTokenInformation(token, TokenUser, None, 0, &mut required_size);
         if required_size == 0 {
-            let _ = CloseHandle(token);
             return None;
         }
 
         // ─── TOKEN_USER を取得 ───
         let mut buffer = vec![0u8; required_size as usize];
-        let token_info_result = GetTokenInformation(
+        GetTokenInformation(
             token,
             TokenUser,
             Some(buffer.as_mut_ptr().cast()),
             required_size,
             &mut required_size,
-        );
-        let _ = CloseHandle(token);
-        token_info_result.ok()?;
+        )
+        .ok()?;
 
         // ─── ユーザー SID を取得 ───
         let token_user = buffer.as_ptr().cast::<TOKEN_USER>();
@@ -713,7 +734,6 @@ fn insert_alias(path: String) {
 
         // 同じファイルハンドル経由で読み込むことで、サイズ検査後の差し替えを防ぐ
         let mut alias_data = String::new();
-        use std::io::Read;
         std::io::BufReader::new(file)
             .read_to_string(&mut alias_data)
             .map_err(|e| format!("ファイルの読み込みに失敗しました: {}", e))?;
