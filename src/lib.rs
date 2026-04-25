@@ -57,7 +57,7 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE,
-    OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile,
+    FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile,
 };
 use windows::Win32::System::Pipes::{
     PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -414,7 +414,8 @@ fn create_server_pipe() -> HANDLE {
     };
 
     if pipe == INVALID_HANDLE_VALUE {
-        tracing::error!("CreateNamedPipeW が失敗しました（同名パイプが既に存在するかアクセスが拒否されました）");
+        let err = windows::core::Error::from_win32();
+        tracing::error!("CreateNamedPipeW が失敗しました: {}", err);
     }
 
     pipe
@@ -455,6 +456,22 @@ impl Drop for TokenHandleGuard {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// `ConvertSidToStringSidW` が確保する SID 文字列バッファの RAII ラッパー。
+///
+/// スコープを抜けると `LocalFree` で SID 文字列バッファを解放する。
+/// `PWSTR::to_string()` が失敗した場合もリークなく解放される。
+struct SidStringGuard(PWSTR);
+
+impl Drop for SidStringGuard {
+    fn drop(&mut self) {
+        if !self.0.as_ptr().is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.as_ptr().cast())));
+            }
         }
     }
 }
@@ -502,14 +519,16 @@ fn build_owner_security_descriptor() -> Option<LocalFreeGuard> {
         .ok()?;
 
         // ─── ユーザー SID を取得 ───
-        let token_user = buffer.as_ptr().cast::<TOKEN_USER>();
-        let user_sid: PSID = (*token_user).User.Sid;
+        // Vec<u8> はアラインメント 1 しか保証しないため read_unaligned で TOKEN_USER を読み出す
+        let token_user = core::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>());
+        let user_sid: PSID = token_user.User.Sid;
 
         // ─── SID を文字列に変換 ───
         let mut sid_pwstr = PWSTR::null();
         ConvertSidToStringSidW(user_sid, &mut sid_pwstr).ok()?;
+        // RAII ガードで確保済みバッファを保護（to_string 失敗時もリークなく解放）
+        let _sid_str_guard = SidStringGuard(sid_pwstr);
         let sid_str = sid_pwstr.to_string().ok()?;
-        let _ = LocalFree(Some(HLOCAL(sid_pwstr.as_ptr().cast())));
 
         // ─── SDDL で現在ユーザーのみに GENERIC_READ/WRITE を許可する DACL を生成 ───
         // D:P = 保護された DACL（継承なし）
@@ -719,6 +738,19 @@ fn insert_alias(path: String) {
             }
             _ => format!("ファイルを開けませんでした: {} ({})", path, e),
         })?;
+
+        // DoS 対策: Named Pipe やデバイスファイルが指定された場合に read_to_string が
+        // ブロックして UI スレッドを占有し続ける事態を防ぐため、通常のディスクファイルのみ許可する。
+        let file_type = unsafe {
+            use std::os::windows::io::AsRawHandle;
+            GetFileType(HANDLE(file.as_raw_handle()))
+        };
+        if file_type != FILE_TYPE_DISK {
+            return Err(format!(
+                "通常のディスクファイルではありません（パイプやデバイスファイルは拒否します）: {}",
+                path
+            ));
+        }
 
         let file_size = file
             .metadata()
