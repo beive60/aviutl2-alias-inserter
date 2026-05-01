@@ -53,8 +53,8 @@ try {
 
     # dll は cdylib のビルド成果物であり PE バイナリのため signtool で署名可能
     # リリース ZIP に同梱する際に .aux2 にリネームする
-    signtool sign /tr https://timestamp.digicert.com /td sha256 /fd sha256 /a $exePath
-    signtool sign /tr https://timestamp.digicert.com /td sha256 /fd sha256 /a $dllPath
+    signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $exePath
+    signtool sign /tr http://timestamp.digicert.com /td sha256 /fd sha256 /a $dllPath
 
     signtool verify /pa $exePath
     signtool verify /pa $dllPath
