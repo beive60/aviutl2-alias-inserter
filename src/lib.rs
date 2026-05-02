@@ -35,7 +35,7 @@
 //! - ペイロード：`.object` ファイルの絶対パス文字列
 //! - 最大ペイロード長：32,768 バイト
 
-use std::path::Path;
+use std::io::Read;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -45,17 +45,26 @@ use std::thread::JoinHandle;
 use aviutl2::AnyResult;
 use aviutl2::generic::{GenericPlugin, GenericPluginTable, GlobalEditHandle, HostAppHandle};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
+    BOOL, CloseHandle, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
+    LocalFree,
+};
+use windows::Win32::Security::{
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING, ReadFile,
+    FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE,
+    FILE_TYPE_DISK, GetFileType, OPEN_EXISTING, PIPE_ACCESS_INBOUND, ReadFile,
 };
-use windows::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
 use windows::Win32::System::Pipes::{
     PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
 };
-use windows::core::PCWSTR;
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::core::{PCWSTR, PWSTR};
 
 // ─────────────────────────────────────────────────────────────
 // 定数
@@ -76,6 +85,12 @@ const PIPE_CONNECT_TIMEOUT_MS: u32 = 5_000;
 /// ダミー接続に使用する書き込みアクセス権（`GENERIC_WRITE = 0x40000000`）。  
 /// `windows::Win32::Security::GENERIC_WRITE` に相当する生 u32 値。
 const GENERIC_WRITE_ACCESS: u32 = 0x4000_0000u32;
+
+/// 受信したエイリアスファイルの最大許容サイズ（バイト）。  
+/// 意図的に巨大なファイルを指定することで AviUtl2 プロセスを OOM クラッシュさせる
+/// DoS 攻撃を防ぐ上限。典型的な `.object` ファイルは数 KiB 以下であるため、
+/// 1 MiB（1,048,576 バイト）は正規の使用を十分にカバーする。
+const MAX_OBJECT_FILE_SIZE: u64 = 1_048_576; // 1 MiB
 
 // ─────────────────────────────────────────────────────────────
 // スレッド間共有ハンドルラッパー
@@ -353,6 +368,12 @@ fn pipe_server_loop(shutdown: Arc<AtomicBool>, active_pipe: Arc<Mutex<Option<Sen
 /// クライアントの `WriteFile` 1 回分が 1 メッセージとして届くことが保証される。
 /// バイトモードと異なり、`ReadFile` で部分的なデータを受け取ることがない。
 ///
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE` を指定することで、同名のパイプが既に存在する場合は
+/// 作成を拒否し、パイプスカッティング（ハイジャック）を防止する。
+///
+/// `build_owner_security_descriptor` が返したセキュリティ記述子を使用して、
+/// 現在のユーザーのみがパイプに接続できる DACL を設定する。
+///
 /// # 戻り値
 ///
 /// 成功時はパイプのハンドル。失敗時は `INVALID_HANDLE_VALUE`。
@@ -362,24 +383,170 @@ fn create_server_pipe() -> HANDLE {
         .chain(std::iter::once(0u16))
         .collect();
 
+    // 現在のユーザーのみアクセス可能なセキュリティ記述子を構築する
+    let sd_guard = build_owner_security_descriptor();
+    if sd_guard.is_none() {
+        tracing::warn!(
+            "セキュリティ記述子の構築に失敗しました。\
+             OS デフォルトのセキュリティ属性でパイプを作成します（同一システム上の別ユーザーからアクセス可能になる場合があります）"
+        );
+    }
+    let sa_storage = sd_guard.as_ref().map(|g| SECURITY_ATTRIBUTES {
+        nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: g.0 .0,
+        bInheritHandle: BOOL(0),
+    });
+    let sa_opt: Option<*const SECURITY_ATTRIBUTES> =
+        sa_storage.as_ref().map(|sa| sa as *const _);
+
     let pipe = unsafe {
         CreateNamedPipeW(
             PCWSTR(pipe_name_wide.as_ptr()),
-            PIPE_ACCESS_INBOUND,
+            // FILE_FLAG_FIRST_PIPE_INSTANCE: 同名パイプが既存の場合は失敗してハイジャックを防止する
+            PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
             MAX_PAYLOAD_BYTES as u32,
             MAX_PAYLOAD_BYTES as u32,
             0,
-            None,
+            sa_opt,
         )
     };
 
     if pipe == INVALID_HANDLE_VALUE {
-        tracing::error!("CreateNamedPipeW が失敗しました");
+        let err = windows::core::Error::from_win32();
+        tracing::error!("CreateNamedPipeW が失敗しました: {}", err);
     }
 
     pipe
+}
+
+// ─────────────────────────────────────────────────────────────
+// セキュリティ記述子ユーティリティ
+// ─────────────────────────────────────────────────────────────
+
+/// `LocalFree` で解放が必要な Windows ヒープメモリの RAII ラッパー。
+///
+/// スコープを抜けると `LocalFree` を呼び出してメモリを解放する。
+struct LocalFreeGuard(PSECURITY_DESCRIPTOR);
+
+impl Drop for LocalFreeGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+            }
+        }
+    }
+}
+
+// 安全性の根拠：`LocalFreeGuard` は生成後、セキュリティ記述子の内部ポインタを
+// 読み取り専用で `SECURITY_ATTRIBUTES` に設定する目的にのみ使用する。
+// `CreateNamedPipeW` 呼び出し後は参照を保持しないため、内容への再アクセスは発生しない。
+// `drop` は任意のスレッドから呼ばれる可能性があるが、`LocalFree` 自体はスレッドセーフであり、
+// ポインタを他のスレッドと共有して読み書きするわけではないため、データ競合は生じない。
+unsafe impl Send for LocalFreeGuard {}
+
+/// `build_owner_security_descriptor` 内でプロセストークンハンドルを RAII 管理する型。
+///
+/// スコープを抜けると自動的に `CloseHandle` を呼び出す。
+struct TokenHandleGuard(HANDLE);
+
+impl Drop for TokenHandleGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// `ConvertSidToStringSidW` が確保する SID 文字列バッファの RAII ラッパー。
+///
+/// スコープを抜けると `LocalFree` で SID 文字列バッファを解放する。
+/// `PWSTR::to_string()` が失敗した場合もリークなく解放される。
+struct SidStringGuard(PWSTR);
+
+impl Drop for SidStringGuard {
+    fn drop(&mut self) {
+        if !self.0.as_ptr().is_null() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.as_ptr().cast())));
+            }
+        }
+    }
+}
+
+/// 現在のプロセスオーナーのみがアクセス可能な Named Pipe 用セキュリティ記述子を構築する。
+///
+/// 処理フロー：
+/// 1. 現在のプロセストークンを開く。
+/// 2. `GetTokenInformation(TokenUser)` で現在ユーザーの SID を取得する。
+/// 3. `ConvertSidToStringSidW` で SID を文字列に変換する。
+/// 4. SDDL `D:P(A;;GRGW;;;<SID>)` で現在ユーザーにのみ汎用読み書きを許可する DACL を定義する。
+/// 5. `ConvertStringSecurityDescriptorToSecurityDescriptorW` でセキュリティ記述子を生成する。
+///
+/// いずれかのステップに失敗した場合は `None` を返す。呼び出し元はその場合
+/// デフォルトのセキュリティ属性（`None`）にフォールバックすること。
+///
+/// # 戻り値
+///
+/// 成功時は `LocalFreeGuard` でラップされたセキュリティ記述子ポインタ。
+/// 失敗時は `None`。
+fn build_owner_security_descriptor() -> Option<LocalFreeGuard> {
+    unsafe {
+        // ─── トークンを開く ───
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        // RAII ガードでトークンを自動クローズ（以降のすべての早期リターンでも確実に閉じる）
+        let _token_guard = TokenHandleGuard(token);
+
+        // ─── TOKEN_USER 情報のバッファサイズを取得 ───
+        let mut required_size = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut required_size);
+        if required_size == 0 {
+            return None;
+        }
+
+        // ─── TOKEN_USER を取得 ───
+        let mut buffer = vec![0u8; required_size as usize];
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            required_size,
+            &mut required_size,
+        )
+        .ok()?;
+
+        // ─── ユーザー SID を取得 ───
+        // Vec<u8> はアラインメント 1 しか保証しないため read_unaligned で TOKEN_USER を読み出す
+        let token_user = core::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>());
+        let user_sid: PSID = token_user.User.Sid;
+
+        // ─── SID を文字列に変換 ───
+        let mut sid_pwstr = PWSTR::null();
+        ConvertSidToStringSidW(user_sid, &mut sid_pwstr).ok()?;
+        // RAII ガードで確保済みバッファを保護（to_string 失敗時もリークなく解放）
+        let _sid_str_guard = SidStringGuard(sid_pwstr);
+        let sid_str = sid_pwstr.to_string().ok()?;
+
+        // ─── SDDL で現在ユーザーのみに GENERIC_READ/WRITE を許可する DACL を生成 ───
+        // D:P = 保護された DACL（継承なし）
+        // A;;GRGW;;;<SID> = <SID> に GENERIC_READ と GENERIC_WRITE を許可
+        let sddl = format!("D:P(A;;GRGW;;;{})", sid_str);
+        let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0u16)).collect();
+
+        let mut sd = PSECURITY_DESCRIPTOR(core::ptr::null_mut());
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl_wide.as_ptr()),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+        .ok()?;
+
+        Some(LocalFreeGuard(sd))
+    }
 }
 
 /// クライアントの接続を待機する（ブロッキング）。
@@ -536,10 +703,11 @@ fn decode_utf16le(bytes: &[u8]) -> Result<String, String> {
 ///
 /// 以下の順序で処理を行う：
 /// 1. 拡張子が `.object` であることを確認する。
-/// 2. ファイルが存在することを確認する。
-/// 3. 編集ハンドルが準備済みであることを確認する。
-/// 4. `call_edit_section()` でメインスレッドに処理を委譲する。
-/// 5. コールバック内でファイルを読み込み、現在のカーソル位置に挿入する。
+/// 2. 編集ハンドルが準備済みであることを確認する。
+/// 3. `call_edit_section()` でメインスレッドに処理を委譲する。
+/// 4. コールバック内でファイルを直接開き、サイズ確認後に読み込んで挿入する。
+///    `exists()` による事前確認は行わず `File::open` のエラーで判断することで
+///    TOCTOU 競合状態を排除する。
 ///
 /// # 引数
 ///
@@ -554,12 +722,6 @@ fn insert_alias(path: String) {
         return;
     }
 
-    // ─── ファイルの存在確認 ───
-    if !Path::new(&path).exists() {
-        tracing::error!("エイリアスファイルが存在しません: {}", path);
-        return;
-    }
-
     // ─── 編集ハンドルの準備状態を確認 ───
     if !EDIT_HANDLE.is_ready() {
         tracing::error!("編集ハンドルがまだ準備できていません（タイムラインが開かれていない可能性があります）");
@@ -568,8 +730,44 @@ fn insert_alias(path: String) {
 
     // ─── メインスレッドで挿入処理を実行 ───
     let result = EDIT_HANDLE.call_edit_section(move |edit_section| -> Result<(), String> {
-        // ファイルの内容を UTF-8 文字列として読み込む
-        let alias_data = std::fs::read_to_string(&path)
+        // TOCTOU 対策: exists() による事前確認は行わず File::open を直接試みる。
+        // DoS 対策: 開いたハンドルのメタデータでサイズを検査してから読み込む。
+        let file = std::fs::File::open(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("エイリアスファイルが存在しません: {}", path)
+            }
+            _ => format!("ファイルを開けませんでした: {} ({})", path, e),
+        })?;
+
+        // DoS 対策: Named Pipe やデバイスファイルが指定された場合に read_to_string が
+        // ブロックして UI スレッドを占有し続ける事態を防ぐため、通常のディスクファイルのみ許可する。
+        let file_type = unsafe {
+            use std::os::windows::io::AsRawHandle;
+            GetFileType(HANDLE(file.as_raw_handle()))
+        };
+        if file_type != FILE_TYPE_DISK {
+            return Err(format!(
+                "通常のディスクファイルではありません（パイプやデバイスファイルは拒否します）: {}",
+                path
+            ));
+        }
+
+        let file_size = file
+            .metadata()
+            .map_err(|e| format!("ファイルのメタデータ取得に失敗しました: {}", e))?
+            .len();
+
+        if file_size > MAX_OBJECT_FILE_SIZE {
+            return Err(format!(
+                "ファイルサイズが上限を超えています（{} バイト、上限 {} バイト）: {}",
+                file_size, MAX_OBJECT_FILE_SIZE, path
+            ));
+        }
+
+        // 同じファイルハンドル経由で読み込むことで、サイズ検査後の差し替えを防ぐ
+        let mut alias_data = String::new();
+        std::io::BufReader::new(file)
+            .read_to_string(&mut alias_data)
             .map_err(|e| format!("ファイルの読み込みに失敗しました: {}", e))?;
 
         // 現在のカーソルフレームとレイヤー番号を取得
